@@ -8414,6 +8414,8 @@ function Library:CreateWindow(WindowInfo)
     local CurrentTabDescription
     local ResizeButton
     local Tabs
+    local TabIndicator
+    local TabsListHolder
     local Container
     local BackgroundImage
     local BottomBackground
@@ -8757,8 +8759,35 @@ function Library:CreateWindow(WindowInfo)
             Size = UDim2.new(0, InitialLeftWidth, 1, -70),
             Parent = MainFrame,
         })
-        New("UIListLayout", {
+
+        -- Shared highlight that slides behind whichever tab button is active,
+        -- instead of each tab fading its own background in/out independently.
+        TabIndicator = New("Frame", {
+            BackgroundColor3 = "MainColor",
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 40),
+            ZIndex = 0,
             Parent = Tabs,
+        })
+        table.insert(
+            Library.Corners,
+            New("UICorner", {
+                CornerRadius = UDim.new(0, Library.CornerRadius),
+                Parent = TabIndicator,
+            })
+        )
+
+        -- Tab buttons live in their own layout holder so the UIListLayout
+        -- below only arranges them, and leaves TabIndicator free to be
+        -- positioned/animated independently.
+        TabsListHolder = New("Frame", {
+            AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 0),
+            Parent = Tabs,
+        })
+        New("UIListLayout", {
+            Parent = TabsListHolder,
         })
 
         --// Container \\--
@@ -9047,7 +9076,7 @@ function Library:CreateWindow(WindowInfo)
                 BackgroundTransparency = 1,
                 Size = UDim2.new(1, 0, 0, 40),
                 Text = "",
-                Parent = Tabs,
+                Parent = TabsListHolder,
             })
             local ButtonPadding = New("UIPadding", {
                 PaddingBottom = UDim.new(0, IsCompact and 6 or 11),
@@ -10032,9 +10061,6 @@ function Library:CreateWindow(WindowInfo)
                 Library.ActiveTab:Hide()
             end
 
-            TweenService:Create(TabButton, Library.TweenInfo, {
-                BackgroundTransparency = 0,
-            }):Play()
             TweenService:Create(TabLabel, Library.TweenInfo, {
                 TextTransparency = 0,
             }):Play()
@@ -10043,6 +10069,12 @@ function Library:CreateWindow(WindowInfo)
                     ImageTransparency = 0,
                 }):Play()
             end
+
+            TweenService:Create(TabIndicator, Library.TweenInfo, {
+                Position = TabButton.Position,
+                Size = TabButton.Size,
+                BackgroundTransparency = 0,
+            }):Play()
 
             if Description then
                 Window:ShowTabInfo(Name, Description)
@@ -10059,10 +10091,6 @@ function Library:CreateWindow(WindowInfo)
         end
 
         function Tab:Hide()
-            TweenService:Create(TabButton, Library.TweenInfo, {
-                BackgroundTransparency = 1,
-            }):Play()
-
             TweenService:Create(TabLabel, Library.TweenInfo, {
                 TextTransparency = 0.5,
             }):Play()
@@ -10186,7 +10214,7 @@ function Library:CreateWindow(WindowInfo)
                 BackgroundTransparency = 1,
                 Size = UDim2.new(1, 0, 0, 40),
                 Text = "",
-                Parent = Tabs,
+                Parent = TabsListHolder,
             })
             local ButtonPadding = New("UIPadding", {
                 PaddingBottom = UDim.new(0, IsCompact and 6 or 11),
@@ -10389,10 +10417,6 @@ function Library:CreateWindow(WindowInfo)
                 Library.ActiveTab:Hide()
             end
 
-            TweenService:Create(TabButton, Library.TweenInfo, {
-                BackgroundTransparency = 0,
-            }):Play()
-
             TweenService:Create(TabLabel, Library.TweenInfo, {
                 TextTransparency = 0,
             }):Play()
@@ -10402,6 +10426,12 @@ function Library:CreateWindow(WindowInfo)
                     ImageTransparency = 0,
                 }):Play()
             end
+
+            TweenService:Create(TabIndicator, Library.TweenInfo, {
+                Position = TabButton.Position,
+                Size = TabButton.Size,
+                BackgroundTransparency = 0,
+            }):Play()
 
             Library:PlayTabAnimation(TabCanvas, true)
 
@@ -10419,10 +10449,6 @@ function Library:CreateWindow(WindowInfo)
         end
 
         function Tab:Hide()
-            TweenService:Create(TabButton, Library.TweenInfo, {
-                BackgroundTransparency = 1,
-            }):Play()
-
             TweenService:Create(TabLabel, Library.TweenInfo, {
                 TextTransparency = 0.5,
             }):Play()
