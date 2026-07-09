@@ -26,11 +26,13 @@ local Window = Library:CreateWindow({
     ShowCustomCursor = true,
 })
 
+-- Second argument is a Lucide icon name (https://lucide.dev/) - without it
+-- the tab still reserves the icon's space, just left blank.
 local Tabs = {
-    Main = Window:AddTab("Main"),
-    Visuals = Window:AddTab("Visuals"),
-    Misc = Window:AddTab("Misc"),
-    ["UI Settings"] = Window:AddTab("UI Settings"),
+    Main = Window:AddTab("Main", "gamepad-2"),
+    Visuals = Window:AddTab("Visuals", "eye"),
+    Misc = Window:AddTab("Misc", "package"),
+    ["UI Settings"] = Window:AddTab("UI Settings", "settings"),
 }
 
 --// Main \\--
