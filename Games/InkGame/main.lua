@@ -79,7 +79,41 @@ end)
 -- Whichever fires first wins. Turn on "Debug Logging" while actually inside
 -- a round to see which source is reliable, then this can be trimmed down to
 -- just that one strategy.
+local UserInputService = game:GetService("UserInputService")
+
 local RedLightGroup = Tabs["Red Light"]:AddLeftGroupbox("Light Monitor")
+local InspectorGroup = Tabs["Red Light"]:AddRightGroupbox("Element Inspector")
+
+-- Returns Track(instance, connection), Clear(), Has(instance) - a tiny
+-- connection bag shared by the light monitor and the inspector below so
+-- neither has to hand-roll its own disconnect bookkeeping.
+local function CreateConnectionTracker()
+    local Store = {}
+
+    local function Track(Instance, Connection)
+        local List = Store[Instance]
+        if not List then
+            List = {}
+            Store[Instance] = List
+        end
+        table.insert(List, Connection)
+    end
+
+    local function Has(Instance)
+        return Store[Instance] ~= nil
+    end
+
+    local function Clear()
+        for _, Connections in pairs(Store) do
+            for _, Connection in ipairs(Connections) do
+                Connection:Disconnect()
+            end
+        end
+        table.clear(Store)
+    end
+
+    return Track, Clear, Has
+end
 
 local LightStatusLabel = RedLightGroup:AddLabel("Status: Unknown")
 
@@ -87,8 +121,9 @@ local LightMonitor = {
     Active = false,
     Debug = false,
     Status = "Unknown",
-    Connections = {}, -- [instance] = {RBXScriptConnection, ...}
 }
+
+local TrackLight, ClearLightConnections, IsLightWatched = CreateConnectionTracker()
 
 local function MatchLightText(text)
     if typeof(text) ~= "string" or text == "" then
@@ -119,17 +154,8 @@ local function SetLightStatus(Status, Source, Instance)
     DebugLog(Source, Status, Instance)
 end
 
-local function Track(Instance, Connection)
-    local List = LightMonitor.Connections[Instance]
-    if not List then
-        List = {}
-        LightMonitor.Connections[Instance] = List
-    end
-    table.insert(List, Connection)
-end
-
 local function WatchTextInstance(Instance)
-    if LightMonitor.Connections[Instance] then return end
+    if IsLightWatched(Instance) then return end
 
     local function Check()
         local Status = MatchLightText(Instance.Text)
@@ -138,12 +164,12 @@ local function WatchTextInstance(Instance)
         end
     end
 
-    Track(Instance, Instance:GetPropertyChangedSignal("Text"):Connect(Check))
+    TrackLight(Instance, Instance:GetPropertyChangedSignal("Text"):Connect(Check))
     Check()
 end
 
 local function WatchSoundInstance(Instance)
-    if LightMonitor.Connections[Instance] then return end
+    if IsLightWatched(Instance) then return end
 
     local function Check()
         local Status = MatchLightText(Instance.Name)
@@ -152,11 +178,11 @@ local function WatchSoundInstance(Instance)
         end
     end
 
-    Track(Instance, Instance.Played:Connect(Check))
+    TrackLight(Instance, Instance.Played:Connect(Check))
 end
 
 local function WatchValueInstance(Instance)
-    if LightMonitor.Connections[Instance] then return end
+    if IsLightWatched(Instance) then return end
 
     local NameStatus = MatchLightText(Instance.Name)
 
@@ -173,7 +199,7 @@ local function WatchValueInstance(Instance)
         end
     end
 
-    Track(Instance, Instance:GetPropertyChangedSignal("Value"):Connect(Check))
+    TrackLight(Instance, Instance:GetPropertyChangedSignal("Value"):Connect(Check))
     Check()
 end
 
@@ -212,7 +238,7 @@ local function StartLightMonitor()
 
     for _, Root in ipairs(Roots) do
         ScanRoot(Root)
-        Track(Root, Root.DescendantAdded:Connect(TryWatch))
+        TrackLight(Root, Root.DescendantAdded:Connect(TryWatch))
     end
 end
 
@@ -220,12 +246,7 @@ local function StopLightMonitor()
     if not LightMonitor.Active then return end
     LightMonitor.Active = false
 
-    for _, Connections in pairs(LightMonitor.Connections) do
-        for _, Connection in ipairs(Connections) do
-            Connection:Disconnect()
-        end
-    end
-    table.clear(LightMonitor.Connections)
+    ClearLightConnections()
 
     LightMonitor.Status = "Unknown"
     LightStatusLabel:SetText("Status: Unknown (monitor off)")
@@ -251,8 +272,145 @@ RedLightGroup:AddToggle("RedLightDebug", {
     LightMonitor.Debug = Value
 end)
 
+-- Element Inspector: text/sound/values didn't reveal anything useful, but
+-- there's a traffic-light icon changing color on screen - this lets you
+-- hover it and grab its exact path + properties (and then watches those
+-- properties live so you can see precisely what flips when the doll turns).
+local TrackInspector, ClearInspectorConnections = CreateConnectionTracker()
+
+local InspectorLog = InspectorGroup:AddLabel("Inspector: nothing picked yet", true)
+
+InspectorGroup:AddLabel(
+    "Hover the mouse over the traffic light icon, then press the pick key. Full paths print to the console; keep watching it while the doll flips to see exactly what changes.",
+    true
+)
+
+local INSPECT_PROPERTIES = {
+    "BackgroundColor3", "BackgroundTransparency",
+    "ImageColor3", "ImageTransparency", "Image",
+    "TextColor3", "Text",
+    "Visible", "Transparency",
+}
+
+local function DescribeInstance(TargetInstance)
+    local Parts = { TargetInstance.ClassName, TargetInstance:GetFullName() }
+
+    for _, PropName in ipairs(INSPECT_PROPERTIES) do
+        local Ok, Value = pcall(function() return TargetInstance[PropName] end)
+        if Ok and Value ~= nil then
+            table.insert(Parts, PropName .. "=" .. tostring(Value))
+        end
+    end
+
+    return table.concat(Parts, " | ")
+end
+
+local function WatchInspectedProperties(TargetInstance)
+    for _, PropName in ipairs(INSPECT_PROPERTIES) do
+        local Ok, Signal = pcall(function()
+            return TargetInstance:GetPropertyChangedSignal(PropName)
+        end)
+
+        if Ok and Signal then
+            TrackInspector(TargetInstance, Signal:Connect(function()
+                local ValueOk, Value = pcall(function() return TargetInstance[PropName] end)
+                if not ValueOk then return end
+
+                local Line = ("%s.%s -> %s"):format(TargetInstance:GetFullName(), PropName, tostring(Value))
+                print("[Ney Hub | Inspector] " .. Line)
+                InspectorLog:SetText(Line)
+            end))
+        end
+    end
+end
+
+local InspectorHighlightGui = nil
+
+local function GetInspectorHighlightGui(PlayerGui)
+    if InspectorHighlightGui and InspectorHighlightGui.Parent then
+        return InspectorHighlightGui
+    end
+
+    InspectorHighlightGui = Instance.new("ScreenGui")
+    InspectorHighlightGui.Name = "NeyHubInspectorHighlight"
+    InspectorHighlightGui.ResetOnSpawn = false
+    InspectorHighlightGui.IgnoreGuiInset = false
+    InspectorHighlightGui.DisplayOrder = 2147483647
+    InspectorHighlightGui.Parent = PlayerGui
+
+    return InspectorHighlightGui
+end
+
+local function FlashHighlight(PlayerGui, TargetInstance)
+    local PosOk, AbsolutePosition = pcall(function() return TargetInstance.AbsolutePosition end)
+    local SizeOk, AbsoluteSize = pcall(function() return TargetInstance.AbsoluteSize end)
+    if not (PosOk and SizeOk) then return end
+
+    local Box = Instance.new("Frame")
+    Box.BackgroundTransparency = 1
+    Box.BorderSizePixel = 0
+    Box.Position = UDim2.fromOffset(AbsolutePosition.X, AbsolutePosition.Y)
+    Box.Size = UDim2.fromOffset(AbsoluteSize.X, AbsoluteSize.Y)
+    Box.ZIndex = 10000
+    Box.Parent = GetInspectorHighlightGui(PlayerGui)
+
+    local Stroke = Instance.new("UIStroke")
+    Stroke.Thickness = 2
+    Stroke.Color = Color3.fromRGB(0, 200, 255)
+    Stroke.Parent = Box
+
+    task.delay(1.5, function()
+        Box:Destroy()
+    end)
+end
+
+local function InspectElementUnderMouse()
+    local LocalPlayer = game:GetService("Players").LocalPlayer
+    local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not PlayerGui then return end
+
+    local MousePosition = UserInputService:GetMouseLocation()
+    local Ok, Hits = pcall(function()
+        return PlayerGui:GetGuiObjectsAtPosition(MousePosition.X, MousePosition.Y)
+    end)
+
+    if not Ok or not Hits or #Hits == 0 then
+        InspectorLog:SetText("Inspector: nothing under the mouse - hover the traffic light first")
+        return
+    end
+
+    ClearInspectorConnections()
+
+    print(("[Ney Hub | Inspector] --- %d element(s) under mouse (top -> bottom) ---"):format(#Hits))
+    for Index, HitInstance in ipairs(Hits) do
+        print(("[Ney Hub | Inspector] #%d %s"):format(Index, DescribeInstance(HitInstance)))
+        WatchInspectedProperties(HitInstance)
+        FlashHighlight(PlayerGui, HitInstance)
+    end
+
+    InspectorLog:SetText(("Picked %d element(s) under mouse - see console, now watching for live changes"):format(#Hits))
+end
+
+InspectorGroup:AddLabel("Pick element under mouse"):AddKeyPicker("InspectKeybind", {
+    Default = "P",
+    Mode = "Press",
+    Text = "Pick Element Under Mouse",
+    Callback = function()
+        InspectElementUnderMouse()
+    end,
+})
+
+InspectorGroup:AddButton("Clear Watches", function()
+    ClearInspectorConnections()
+    InspectorLog:SetText("Inspector: watches cleared")
+end)
+
 Library:OnUnload(function()
     StopLightMonitor()
+    ClearInspectorConnections()
+    if InspectorHighlightGui then
+        InspectorHighlightGui:Destroy()
+    end
 end)
 
 --// Dalgona \\--
