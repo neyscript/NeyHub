@@ -69,19 +69,19 @@ MainGroup:AddButton("Reset Walkspeed", function()
 end)
 
 --// Red Light \\--
--- We don't have the real remote/value names for this round yet (no live
--- session to reverse engineer against), so instead of hardcoding a guess
--- this watches every signal a Squid-Game-style Red Light/Green Light round
--- realistically exposes to the client at once:
---   1) on-screen status text  (a TextLabel/TextButton showing "Red Light"/"Green Light")
---   2) sound cues             (a Sound instance named after the callout)
---   3) status value objects   (Bool/String/IntValue named like a light/round/doll state)
--- Whichever fires first wins. Turn on "Debug Logging" while actually inside
--- a round to see which source is reliable, then this can be trimmed down to
--- just that one strategy.
+-- Confirmed via the Element Inspector below: the traffic-light HUD icon is
+-- an ImageLabel named "TrafficLightEmpty" under PlayerGui, and its `.Image`
+-- property swaps between two rbxassetids depending on the round state.
+-- We don't hardcode which id means Red and which means Green here (that's
+-- exactly the kind of thing that's easy to get backwards from a screenshot,
+-- and getting it backwards would auto-walk on red instead of freezing) -
+-- calibrate it live instead with the "Set Current As Red/Green Light"
+-- buttons while actually looking at the doll.
 local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = game:GetService("Players").LocalPlayer
 
 local RedLightGroup = Tabs["Red Light"]:AddLeftGroupbox("Light Monitor")
+local AutoPassGroup = Tabs["Red Light"]:AddLeftGroupbox("Auto Pass")
 local InspectorGroup = Tabs["Red Light"]:AddRightGroupbox("Element Inspector")
 
 -- Returns Track(instance, connection), Clear(), Has(instance) - a tiny
@@ -123,102 +123,72 @@ local LightMonitor = {
     Status = "Unknown",
 }
 
-local TrackLight, ClearLightConnections, IsLightWatched = CreateConnectionTracker()
+-- Fill these in with the values printed by the "Set Current As ..." buttons
+-- below once calibrated, so the script works without a manual calibration
+-- step every time. Live calibration always overrides these at runtime.
+local DEFAULT_RED_IMAGE_ID = nil
+local DEFAULT_GREEN_IMAGE_ID = nil
+local DEFAULT_FINISH_POSITION = nil -- Vector3.new(x, y, z), from "Save Finish Position"
 
-local function MatchLightText(text)
-    if typeof(text) ~= "string" or text == "" then
-        return nil
-    end
+local Calibration = {
+    RedImageId = DEFAULT_RED_IMAGE_ID,
+    GreenImageId = DEFAULT_GREEN_IMAGE_ID,
+}
 
-    local Lower = text:lower()
+local TrackLight, ClearLightConnections = CreateConnectionTracker()
 
-    if Lower:find("red%s*light") then
-        return "Red"
-    elseif Lower:find("green%s*light") then
-        return "Green"
-    end
-
-    return nil
+local LightStatusListeners = {}
+local function OnLightStatusChanged(Callback)
+    table.insert(LightStatusListeners, Callback)
 end
 
-local function DebugLog(Source, Status, Instance)
-    if not LightMonitor.Debug then return end
-    print(("[Ney Hub | Red Light] %s -> %s (%s)"):format(Source, Status, Instance:GetFullName()))
-end
-
-local function SetLightStatus(Status, Source, Instance)
+local function SetLightStatus(Status, Source)
     if LightMonitor.Status == Status then return end
 
     LightMonitor.Status = Status
     LightStatusLabel:SetText("Status: " .. Status)
-    DebugLog(Source, Status, Instance)
-end
 
-local function WatchTextInstance(Instance)
-    if IsLightWatched(Instance) then return end
-
-    local function Check()
-        local Status = MatchLightText(Instance.Text)
-        if Status then
-            SetLightStatus(Status, "GUI Text", Instance)
-        end
+    if LightMonitor.Debug then
+        print(("[Ney Hub | Red Light] %s -> %s"):format(Source, Status))
     end
 
-    TrackLight(Instance, Instance:GetPropertyChangedSignal("Text"):Connect(Check))
-    Check()
-end
-
-local function WatchSoundInstance(Instance)
-    if IsLightWatched(Instance) then return end
-
-    local function Check()
-        local Status = MatchLightText(Instance.Name)
-        if Status then
-            SetLightStatus(Status, "Sound", Instance)
-        end
-    end
-
-    TrackLight(Instance, Instance.Played:Connect(Check))
-end
-
-local function WatchValueInstance(Instance)
-    if IsLightWatched(Instance) then return end
-
-    local NameStatus = MatchLightText(Instance.Name)
-
-    local function Check()
-        if Instance:IsA("BoolValue") then
-            if NameStatus and Instance.Value then
-                SetLightStatus(NameStatus, Instance.ClassName .. " flag", Instance)
-            end
-        else
-            local Status = MatchLightText(tostring(Instance.Value))
-            if Status then
-                SetLightStatus(Status, Instance.ClassName, Instance)
-            end
-        end
-    end
-
-    TrackLight(Instance, Instance:GetPropertyChangedSignal("Value"):Connect(Check))
-    Check()
-end
-
-local function TryWatch(Instance)
-    if Instance:IsA("TextLabel") or Instance:IsA("TextButton") then
-        WatchTextInstance(Instance)
-    elseif Instance:IsA("Sound") then
-        WatchSoundInstance(Instance)
-    elseif Instance:IsA("BoolValue") or Instance:IsA("StringValue") or Instance:IsA("IntValue") then
-        local Lower = Instance.Name:lower()
-        if Lower:find("light") or Lower:find("round") or Lower:find("doll") then
-            WatchValueInstance(Instance)
-        end
+    for _, Callback in ipairs(LightStatusListeners) do
+        task.spawn(Callback, Status)
     end
 end
 
-local function ScanRoot(Root)
-    for _, Instance in ipairs(Root:GetDescendants()) do
-        TryWatch(Instance)
+local TrafficLightInstance = nil
+local TrafficLightConnection = nil
+
+local function HandleTrafficLightImageChanged()
+    local Image = TrafficLightInstance.Image
+
+    if LightMonitor.Debug then
+        print(("[Ney Hub | Red Light] TrafficLightEmpty.Image -> %s"):format(tostring(Image)))
+    end
+
+    if Calibration.RedImageId and Image == Calibration.RedImageId then
+        SetLightStatus("Red", "TrafficLightEmpty.Image")
+    elseif Calibration.GreenImageId and Image == Calibration.GreenImageId then
+        SetLightStatus("Green", "TrafficLightEmpty.Image")
+    end
+end
+
+local function BindTrafficLight(Instance)
+    if TrafficLightInstance == Instance then return end
+
+    if TrafficLightConnection then
+        TrafficLightConnection:Disconnect()
+    end
+
+    TrafficLightInstance = Instance
+    TrafficLightConnection = Instance:GetPropertyChangedSignal("Image"):Connect(HandleTrafficLightImageChanged)
+    HandleTrafficLightImageChanged()
+end
+
+local function TryBindTrafficLight(Instance)
+    if Instance.Name == "TrafficLightEmpty" and (Instance:IsA("ImageLabel") or Instance:IsA("ImageButton")) then
+        BindTrafficLight(Instance)
     end
 end
 
@@ -228,18 +198,13 @@ local function StartLightMonitor()
     LightMonitor.Status = "Unknown"
     LightStatusLabel:SetText("Status: Unknown")
 
-    local Roots = { workspace, game:GetService("ReplicatedStorage") }
-
-    local LocalPlayer = game:GetService("Players").LocalPlayer
     local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if PlayerGui then
-        table.insert(Roots, PlayerGui)
-    end
+    if not PlayerGui then return end
 
-    for _, Root in ipairs(Roots) do
-        ScanRoot(Root)
-        TrackLight(Root, Root.DescendantAdded:Connect(TryWatch))
+    for _, Instance in ipairs(PlayerGui:GetDescendants()) do
+        TryBindTrafficLight(Instance)
     end
+    TrackLight(PlayerGui, PlayerGui.DescendantAdded:Connect(TryBindTrafficLight))
 end
 
 local function StopLightMonitor()
@@ -248,6 +213,12 @@ local function StopLightMonitor()
 
     ClearLightConnections()
 
+    if TrafficLightConnection then
+        TrafficLightConnection:Disconnect()
+        TrafficLightConnection = nil
+    end
+    TrafficLightInstance = nil
+
     LightMonitor.Status = "Unknown"
     LightStatusLabel:SetText("Status: Unknown (monitor off)")
 end
@@ -255,7 +226,7 @@ end
 RedLightGroup:AddToggle("RedLightMonitor", {
     Text = "Monitor Light Status",
     Default = false,
-    Tooltip = "Watches on-screen text, sound cues and status values to work out whether it's currently Red Light or Green Light",
+    Tooltip = "Watches the TrafficLightEmpty icon's Image property to work out whether it's currently Red Light or Green Light",
 }):OnChanged(function(Value)
     if Value then
         StartLightMonitor()
@@ -267,9 +238,121 @@ end)
 RedLightGroup:AddToggle("RedLightDebug", {
     Text = "Debug Logging",
     Default = false,
-    Tooltip = "Prints every detection match to the console - enable while actually inside a Red Light round to see which source fires reliably",
+    Tooltip = "Prints every raw Image change and status flip to the console",
 }):OnChanged(function(Value)
     LightMonitor.Debug = Value
+end)
+
+--// Auto Pass \\--
+-- Freezes movement on Red, walks to the saved finish position on Green.
+-- With no finish position saved it still just freezes on red (auto stop)
+-- and leaves movement to you on green.
+local CalibrationLabel = AutoPassGroup:AddLabel("Calibration - Red: not set | Green: not set")
+local FinishLabel = AutoPassGroup:AddLabel("Finish position: not set")
+
+local FinishPosition = DEFAULT_FINISH_POSITION
+if FinishPosition then
+    FinishLabel:SetText(("Finish position: %.1f, %.1f, %.1f"):format(FinishPosition.X, FinishPosition.Y, FinishPosition.Z))
+end
+
+local function RefreshCalibrationLabel()
+    CalibrationLabel:SetText(("Calibration - Red: %s | Green: %s"):format(
+        Calibration.RedImageId and "set" or "not set",
+        Calibration.GreenImageId and "set" or "not set"
+    ))
+end
+
+local function CalibrateLight(Which, Label)
+    if not TrafficLightInstance then
+        Library:Notify("Traffic light not found yet - turn on Monitor Light Status inside a Red Light round first", 4)
+        return
+    end
+
+    Calibration[Which] = TrafficLightInstance.Image
+    RefreshCalibrationLabel()
+
+    print(("[Ney Hub | Red Light] Calibrated %s light = %s"):format(Label, Calibration[Which]))
+    Library:Notify("Calibrated " .. Label .. " light", 2)
+end
+
+AutoPassGroup:AddButton("Set Current As Red Light", function()
+    CalibrateLight("RedImageId", "Red")
+end)
+
+AutoPassGroup:AddButton("Set Current As Green Light", function()
+    CalibrateLight("GreenImageId", "Green")
+end)
+
+AutoPassGroup:AddButton("Save Finish Position", function()
+    local Character = LocalPlayer.Character
+    local HumanoidRootPart = Character and Character:FindFirstChild("HumanoidRootPart")
+    if not HumanoidRootPart then
+        Library:Notify("No character found - can't save a position", 3)
+        return
+    end
+
+    FinishPosition = HumanoidRootPart.Position
+    FinishLabel:SetText(("Finish position: %.1f, %.1f, %.1f"):format(FinishPosition.X, FinishPosition.Y, FinishPosition.Z))
+
+    print(("[Ney Hub | Red Light] Finish position saved: Vector3.new(%.3f, %.3f, %.3f)"):format(FinishPosition.X, FinishPosition.Y, FinishPosition.Z))
+    Library:Notify("Finish position saved - see console for exact coords", 3)
+end)
+
+local function FreezeMovement()
+    local Character = LocalPlayer.Character
+    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+    local HumanoidRootPart = Character and Character:FindFirstChild("HumanoidRootPart")
+    if not (Humanoid and HumanoidRootPart) then return end
+
+    Humanoid.WalkSpeed = 0
+    Humanoid:MoveTo(HumanoidRootPart.Position)
+end
+
+local function ResumeMovement()
+    local Character = LocalPlayer.Character
+    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+    if not Humanoid then return end
+
+    Humanoid.WalkSpeed = (Options.WalkSpeed and Options.WalkSpeed.Value) or 16
+
+    if FinishPosition then
+        Humanoid:MoveTo(FinishPosition)
+    end
+end
+
+local AutoPassActive = false
+
+OnLightStatusChanged(function(Status)
+    if not AutoPassActive then return end
+
+    if Status == "Red" then
+        FreezeMovement()
+    elseif Status == "Green" then
+        ResumeMovement()
+    end
+end)
+
+AutoPassGroup:AddToggle("AutoPass", {
+    Text = "Auto Pass",
+    Default = false,
+    Tooltip = "Freezes on Red, auto-walks to the saved finish position on Green. Needs both lights calibrated; without a saved finish position it only freezes on Red.",
+}):OnChanged(function(Value)
+    AutoPassActive = Value
+    if not Value then return end
+
+    if not LightMonitor.Active then
+        Options.RedLightMonitor:SetValue(true)
+    end
+
+    if not (Calibration.RedImageId and Calibration.GreenImageId) then
+        Library:Notify("Calibrate both Red and Green lights first", 3)
+    end
+
+    if LightMonitor.Status == "Red" then
+        FreezeMovement()
+    elseif LightMonitor.Status == "Green" then
+        ResumeMovement()
+    end
 end)
 
 -- Element Inspector: text/sound/values didn't reveal anything useful, but
@@ -369,7 +452,6 @@ local function FlashHighlight(PlayerGui, TargetInstance)
 end
 
 local function InspectElementAtPosition(ScreenPosition)
-    local LocalPlayer = game:GetService("Players").LocalPlayer
     local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not PlayerGui then return end
 
