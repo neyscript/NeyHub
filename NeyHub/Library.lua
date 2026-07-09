@@ -11174,32 +11174,59 @@ function Library:CreateWindow(WindowInfo)
     end
 
     if Library.IsMobile then
-        local ToggleButton = Library:AddDraggableButton("Toggle", function()
-            Library:Toggle()
-        end, true, true)
+        -- Single icon-only floating button: tap toggles the UI, holding it
+        -- down toggles whether the main window can be dragged (the icon
+        -- swaps to a lock to show the current state). This replaces the old
+        -- two separate text buttons (Toggle/Lock), which ate up screen space.
+        local UnlockedIcon = "menu"
+        local LockedIcon = "lock"
+        local LongPressSeconds = 0.5
 
-        local LockButton = Library:AddDraggableButton("Lock", function(self)
-            Library.CantDragForced = not Library.CantDragForced
-            self:SetText(Library.CantDragForced and "Unlock" or "Lock")
-        end, true, true)
+        local ToggleButton = Library:AddDraggableImageButton({
+            Icon = UnlockedIcon,
+            IconSize = 20,
+            Callback = function()
+                Library:Toggle()
+            end,
+            ExcludeScaling = true,
+            ExcludeDragging = true,
+        })
+
+        ToggleButton.Button.InputBegan:Connect(function(Input: InputObject)
+            if not IsClickInput(Input) then
+                return
+            end
+
+            local LongPressTask = task.delay(LongPressSeconds, function()
+                Library.CantDragForced = not Library.CantDragForced
+                ToggleButton:SetIcon(Library.CantDragForced and LockedIcon or UnlockedIcon)
+            end)
+
+            local Changed
+            Changed = Input.Changed:Connect(function()
+                if Input.UserInputState ~= Enum.UserInputState.End then
+                    return
+                end
+
+                task.cancel(LongPressTask)
+
+                if Changed and Changed.Connected then
+                    Changed:Disconnect()
+                    Changed = nil
+                end
+            end)
+        end)
 
         if WindowInfo.MobileButtonsSide == "Right" then
             ToggleButton.Button.AnchorPoint = Vector2.new(1, 0)
             ToggleButton.Button.Position = UDim2.new(1, -6, 0, 6)
-
-            LockButton.Button.AnchorPoint = Vector2.new(1, 0)
-            LockButton.Button.Position = UDim2.new(1, -(ToggleButton.Button.Size.X.Offset + 12), 0, 6)
         else
             ToggleButton.Button.AnchorPoint = Vector2.new(0, 0)
             ToggleButton.Button.Position = UDim2.fromOffset(6, 6)
-
-            LockButton.Button.AnchorPoint = Vector2.new(0, 0)
-            LockButton.Button.Position = UDim2.fromOffset(ToggleButton.Button.Size.X.Offset + 12, 6)
         end
 
         if WindowInfo.ShowMobileButtons == false then
             ToggleButton.Button.Visible = false
-            LockButton.Button.Visible = false
         end
     end
 

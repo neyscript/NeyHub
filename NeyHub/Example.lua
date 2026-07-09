@@ -17,7 +17,8 @@ local Window = Library:CreateWindow({
 	-- Set Center to true if you want the menu to appear in the center
 	-- Set AutoShow to true if you want the menu to appear when it is created
 	-- Set Resizable to true if you want to have in-game resizable Window
-	-- Set MobileButtonsSide to "Left" or "Right" if you want the ui toggle & lock buttons to be on the left or right side of the window
+	-- Set MobileButtonsSide to "Left" or "Right" for which side the mobile floating button sits on
+	-- (tap it to show/hide the UI, hold it to lock/unlock dragging the window)
 	-- Set ShowCustomCursor to false if you don't want to use the Linoria cursor
 	-- NotifySide = Changes the side of the notifications (Left, Right) (Default value = Left)
 	-- Position and Size are also valid options here
