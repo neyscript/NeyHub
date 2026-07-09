@@ -274,14 +274,18 @@ end)
 
 -- Element Inspector: text/sound/values didn't reveal anything useful, but
 -- there's a traffic-light icon changing color on screen - this lets you
--- hover it and grab its exact path + properties (and then watches those
+-- tap it and grab its exact path + properties (and then watches those
 -- properties live so you can see precisely what flips when the doll turns).
+-- Mouse-hover + keybind doesn't work on mobile (Delta etc. have no mouse or
+-- keyboard), so picking works by arming a one-shot tap: press the button,
+-- then the very next tap/click anywhere on screen is used as the pick
+-- position - this works the same on PC and on touch executors.
 local TrackInspector, ClearInspectorConnections = CreateConnectionTracker()
 
 local InspectorLog = InspectorGroup:AddLabel("Inspector: nothing picked yet", true)
 
 InspectorGroup:AddLabel(
-    "Hover the mouse over the traffic light icon, then press the pick key. Full paths print to the console; keep watching it while the doll flips to see exactly what changes.",
+    "Press \"Arm Inspect\", then tap/click the traffic light icon on screen. Full paths print to the console; keep watching it while the doll flips to see exactly what changes.",
     true
 )
 
@@ -364,41 +368,59 @@ local function FlashHighlight(PlayerGui, TargetInstance)
     end)
 end
 
-local function InspectElementUnderMouse()
+local function InspectElementAtPosition(ScreenPosition)
     local LocalPlayer = game:GetService("Players").LocalPlayer
     local PlayerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not PlayerGui then return end
 
-    local MousePosition = UserInputService:GetMouseLocation()
     local Ok, Hits = pcall(function()
-        return PlayerGui:GetGuiObjectsAtPosition(MousePosition.X, MousePosition.Y)
+        return PlayerGui:GetGuiObjectsAtPosition(ScreenPosition.X, ScreenPosition.Y)
     end)
 
     if not Ok or not Hits or #Hits == 0 then
-        InspectorLog:SetText("Inspector: nothing under the mouse - hover the traffic light first")
+        InspectorLog:SetText("Inspector: nothing under that tap - try again")
         return
     end
 
     ClearInspectorConnections()
 
-    print(("[Ney Hub | Inspector] --- %d element(s) under mouse (top -> bottom) ---"):format(#Hits))
+    print(("[Ney Hub | Inspector] --- %d element(s) at tap position (top -> bottom) ---"):format(#Hits))
     for Index, HitInstance in ipairs(Hits) do
         print(("[Ney Hub | Inspector] #%d %s"):format(Index, DescribeInstance(HitInstance)))
         WatchInspectedProperties(HitInstance)
         FlashHighlight(PlayerGui, HitInstance)
     end
 
-    InspectorLog:SetText(("Picked %d element(s) under mouse - see console, now watching for live changes"):format(#Hits))
+    InspectorLog:SetText(("Picked %d element(s) - see console, now watching for live changes"):format(#Hits))
 end
 
-InspectorGroup:AddLabel("Pick element under mouse"):AddKeyPicker("InspectKeybind", {
-    Default = "P",
-    Mode = "Press",
-    Text = "Pick Element Under Mouse",
-    Callback = function()
-        InspectElementUnderMouse()
-    end,
-})
+local InspectArmed = false
+local InspectArmConnection = nil
+
+local function ArmInspectPick()
+    if InspectArmed then return end
+    InspectArmed = true
+    InspectorLog:SetText("Inspector: armed - tap/click the traffic light on screen")
+
+    InspectArmConnection = UserInputService.InputBegan:Connect(function(Input, GameProcessedEvent)
+        if GameProcessedEvent then return end
+
+        local InputType = Input.UserInputType
+        if InputType ~= Enum.UserInputType.Touch and InputType ~= Enum.UserInputType.MouseButton1 then
+            return
+        end
+
+        InspectArmConnection:Disconnect()
+        InspectArmConnection = nil
+        InspectArmed = false
+
+        InspectElementAtPosition(Input.Position)
+    end)
+end
+
+InspectorGroup:AddButton("Arm Inspect (tap target next)", function()
+    ArmInspectPick()
+end)
 
 InspectorGroup:AddButton("Clear Watches", function()
     ClearInspectorConnections()
@@ -408,6 +430,9 @@ end)
 Library:OnUnload(function()
     StopLightMonitor()
     ClearInspectorConnections()
+    if InspectArmConnection then
+        InspectArmConnection:Disconnect()
+    end
     if InspectorHighlightGui then
         InspectorHighlightGui:Destroy()
     end
