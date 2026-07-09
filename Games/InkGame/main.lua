@@ -10,9 +10,7 @@
     Main/Visuals/Misc sections for that game's actual logic.
 ]]
 
--- TODO: once this repo is pushed to GitHub, point this at your own
--- raw.githubusercontent.com/<user>/<repo>/main/ URL
-local REPO = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/"
+local REPO = "https://raw.githubusercontent.com/neyscript/NeyHub/main/"
 
 local Library = loadstring(game:HttpGet(REPO .. "NeyHub/Library.lua"))()
 local ThemeManager = loadstring(game:HttpGet(REPO .. "NeyHub/addons/ThemeManager.lua"))()
