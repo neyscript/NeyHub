@@ -32,6 +32,7 @@ local Tabs = {
     Main = Window:AddTab("Main", "gamepad-2"),
     ["Red Light"] = Window:AddTab("Red Light", "traffic-cone"),
     Dalgona = Window:AddTab("Dalgona", "cookie"),
+    ["Hide n Seek"] = Window:AddTab("Hide n Seek", "ghost"),
     Visuals = Window:AddTab("Visuals", "eye"),
     Misc = Window:AddTab("Misc", "package"),
     ["UI Settings"] = Window:AddTab("UI Settings", "settings"),
@@ -468,6 +469,478 @@ Library:OnUnload(function()
     AntiCrackEnabled = false
     AutoCompleteEnabled = false
     RestoreAntiCrack()
+end)
+
+--// Hide n Seek \\--
+-- Same rhythm as Dalgona: the whole mode is driven through one wrapped remote -
+-- ReplicatedStorage.Modules.RemoteWrapper over Remotes.TemporaryReachedBindable.
+-- Every client action is a :FireServer(payload) on it:
+--   { AttemptingToEscape = door } -> feed one held key into a working exit
+--   { ESCAPING = door }           -> escape once that exit has all 3 keys (CANESCAPE)
+--   { AttemptingToUnlock = door }  -> unlock a KeyNeeded door you hold the key for
+--   { AttemptingToBarricadeDoor=..,IsInside=.. } -> barricade
+-- Keys held live in LocalPlayer.CurrentKeys (children named Square/Triangle/Circle).
+-- The real final exit is an EXITDOOR model with attribute ActuallyWorks (the
+-- fakes carry DoesntWork); it needs all 3 keys, tracked via same-named boolean
+-- attributes, and the server flips CANESCAPE once they're all in. Exits sit
+-- under workspace.HideAndSeekMap.NEWFIXEDDOORS.Floor{1,2,3}.EXITDOORS.
+--
+-- Auto Escape is therefore a small state machine: grab the missing keys, then
+-- feed them into the working exit and fire ESCAPING - all through the game's
+-- own remote. The one thing the module doesn't expose is where the collectible
+-- keys physically sit (the server just populates CurrentKeys), so we locate
+-- world keys heuristically; that part may need live calibration per map.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local HideSeekTab = Tabs["Hide n Seek"]
+local HNS_KEYS = { "Square", "Triangle", "Circle" }
+
+local function GetGuiParent()
+    local ok, Hui = pcall(function() return gethui and gethui() end)
+    if ok and Hui then return Hui end
+    return game:GetService("CoreGui")
+end
+
+local function GetHRP()
+    local Character = LocalPlayer.Character
+    return Character and Character:FindFirstChild("HumanoidRootPart"), Character
+end
+
+local function IsHider()
+    return LocalPlayer:GetAttribute("IsHider") == true
+end
+
+local function HeldKey(Name)
+    local Folder = LocalPlayer:FindFirstChild("CurrentKeys")
+    return Folder and Folder:FindFirstChild(Name) ~= nil
+end
+
+local function MissingKeys()
+    local Missing = {}
+    for _, Key in ipairs(HNS_KEYS) do
+        if not HeldKey(Key) then
+            table.insert(Missing, Key)
+        end
+    end
+    return Missing
+end
+
+--// The wrapped remote \\--
+-- Primary: rebuild the wrapper the same way the module does - firing it hits the
+-- same underlying RemoteEvent, so the server sees an identical call. Fallback:
+-- pull the live v_u_12 upvalue off the render closure (constants NEWFIXEDDOORS /
+-- CANESCAPE) in case RemoteWrapper isn't safely re-entrant.
+local HnSRemote = nil
+
+local function AcquireRemoteViaModule()
+    local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    local Bindable = Remotes and Remotes:FindFirstChild("TemporaryReachedBindable")
+    local Modules = ReplicatedStorage:FindFirstChild("Modules")
+    local WrapperModule = Modules and Modules:FindFirstChild("RemoteWrapper")
+    if not (Bindable and WrapperModule) then return nil end
+    local ok, Wrapper = pcall(function()
+        return require(WrapperModule)(Bindable)
+    end)
+    if ok and type(Wrapper) == "table" and type(Wrapper.FireServer) == "function" then
+        return Wrapper
+    end
+    return nil
+end
+
+local function AcquireRemoteViaUpvalues()
+    if not (Getgc and GetUpvalues) then return nil end
+    local ok, GC = pcall(Getgc, true)
+    if not ok then return nil end
+    for _, Fn in pairs(GC) do
+        if type(Fn) == "function" and (not IsLClosure or IsLClosure(Fn)) then
+            if FnHasConstants(Fn, { "NEWFIXEDDOORS", "CANESCAPE" }) then
+                local upsOk, Ups = pcall(GetUpvalues, Fn)
+                if upsOk and Ups then
+                    for _, Value in pairs(Ups) do
+                        if type(Value) == "table" and type(Value.FireServer) == "function" then
+                            return Value
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function GetRemote()
+    if HnSRemote then return HnSRemote end
+    HnSRemote = AcquireRemoteViaModule() or AcquireRemoteViaUpvalues()
+    return HnSRemote
+end
+
+local function FireRemote(Payload)
+    local Remote = GetRemote()
+    if not Remote then return false end
+    return pcall(function()
+        Remote:FireServer(Payload)
+    end)
+end
+
+--// Doors \\--
+local function GetFixedDoors()
+    local Map = workspace:FindFirstChild("HideAndSeekMap")
+    return Map and Map:FindFirstChild("NEWFIXEDDOORS")
+end
+
+local function ForEachExitDoor(Callback)
+    local Fixed = GetFixedDoors()
+    if not Fixed then return end
+    for _, Floor in ipairs(Fixed:GetChildren()) do
+        if Floor.Name:match("^Floor") then
+            local ExitDoors = Floor:FindFirstChild("EXITDOORS")
+            if ExitDoors then
+                for _, Door in ipairs(ExitDoors:GetChildren()) do
+                    if Door:IsA("Model") and Door.Name == "EXITDOOR" then
+                        Callback(Door)
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function DoorAnchor(Door)
+    if Door.PrimaryPart then return Door.PrimaryPart end
+    local DoorPart = Door:FindFirstChild("DoorPart")
+    return DoorPart and DoorPart:FindFirstChild("MainDoorPart")
+end
+
+local function DoorKeyCount(Door)
+    local Count = 0
+    for _, Key in ipairs(HNS_KEYS) do
+        if Door:GetAttribute(Key) then Count = Count + 1 end
+    end
+    return Count
+end
+
+-- The one exit that actually opens (fakes carry DoesntWork).
+local function FindWorkingExit()
+    local Working
+    ForEachExitDoor(function(Door)
+        if Door:GetAttribute("ActuallyWorks") and not Door:GetAttribute("DoesntWork") then
+            Working = Working or Door
+        end
+    end)
+    return Working
+end
+
+--// World keys (heuristic - calibrate live if empty) \\--
+-- The module never touches the collectible keys, so we sweep the map for shape-
+-- named parts/models that aren't the exit-door key slots (those live under
+-- NEWFIXEDDOORS). Returns { { Instance = ..., Shape = "Square" }, ... }.
+local function FindWorldKeys(FilterShape)
+    local Map = workspace:FindFirstChild("HideAndSeekMap")
+    local Result = {}
+    if not Map then return Result end
+    local Fixed = GetFixedDoors()
+    for _, Desc in ipairs(Map:GetDescendants()) do
+        local Shape
+        for _, Key in ipairs(HNS_KEYS) do
+            if Desc.Name == Key then Shape = Key break end
+        end
+        if Shape and (not FilterShape or FilterShape == Shape)
+            and not (Fixed and Desc:IsDescendantOf(Fixed)) then
+            local Anchor = (Desc:IsA("Model") and Desc.PrimaryPart) or (Desc:IsA("BasePart") and Desc)
+            if Anchor then
+                table.insert(Result, { Instance = Desc, Anchor = Anchor, Shape = Shape })
+            end
+        end
+    end
+    return Result
+end
+
+--// ESP \\--
+local ESPFolder = Instance.new("Folder")
+ESPFolder.Name = "NeyHubHNS_ESP"
+ESPFolder.Parent = GetGuiParent()
+
+local HIDER_COLOR = Color3.fromRGB(60, 200, 90)
+local SEEKER_COLOR = Color3.fromRGB(235, 60, 60)
+local EXIT_OK_COLOR = Color3.fromRGB(70, 200, 120)
+local EXIT_FAKE_COLOR = Color3.fromRGB(200, 60, 60)
+local KEY_COLOR = Color3.fromRGB(240, 210, 70)
+
+local function MakeHighlight(Adornee, FillColor)
+    local H = Instance.new("Highlight")
+    H.Adornee = Adornee
+    H.FillColor = FillColor
+    H.FillTransparency = 0.6
+    H.OutlineColor = FillColor
+    H.OutlineTransparency = 0
+    H.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    H.Parent = ESPFolder
+    return H
+end
+
+local function MakeBillboard(Adornee, Text, TextColor)
+    local B = Instance.new("BillboardGui")
+    B.Adornee = Adornee
+    B.Size = UDim2.new(0, 220, 0, 34)
+    B.StudsOffset = Vector3.new(0, 3, 0)
+    B.AlwaysOnTop = true
+    B.Parent = ESPFolder
+    local L = Instance.new("TextLabel")
+    L.BackgroundTransparency = 1
+    L.Size = UDim2.new(1, 0, 1, 0)
+    L.Font = Enum.Font.GothamBold
+    L.TextSize = 14
+    L.TextColor3 = TextColor or Color3.new(1, 1, 1)
+    L.TextStrokeTransparency = 0.4
+    L.Text = Text
+    L.Parent = B
+    return B
+end
+
+local PlayerESPEnabled = false
+local ExitESPEnabled = false
+local KeyESPEnabled = false
+
+local PlayerESPObjects = {}
+local ExitESPObjects = {}
+local KeyESPObjects = {}
+
+local function ClearList(List)
+    for _, Obj in ipairs(List) do
+        if Obj then Obj:Destroy() end
+    end
+    table.clear(List)
+end
+
+local function RebuildPlayerESP()
+    ClearList(PlayerESPObjects)
+    if not PlayerESPEnabled then return end
+    local HRP = GetHRP()
+    for _, Plr in ipairs(Players:GetPlayers()) do
+        if Plr ~= LocalPlayer then
+            local Char = Plr.Character
+            local Anchor = Char and (Char:FindFirstChild("Head") or Char:FindFirstChild("HumanoidRootPart"))
+            if Char and Anchor then
+                local PlrHider = Plr:GetAttribute("IsHider") == true
+                local Color = PlrHider and HIDER_COLOR or SEEKER_COLOR
+                local Role = PlrHider and "HIDER" or "SEEKER"
+                local Dist = HRP and math.floor((HRP.Position - Anchor.Position).Magnitude) or 0
+                table.insert(PlayerESPObjects, MakeHighlight(Char, Color))
+                table.insert(PlayerESPObjects,
+                    MakeBillboard(Anchor, ("%s [%s] %dm"):format(Plr.Name, Role, Dist), Color))
+            end
+        end
+    end
+end
+
+local function RebuildExitESP()
+    ClearList(ExitESPObjects)
+    if not ExitESPEnabled then return end
+    ForEachExitDoor(function(Door)
+        local Anchor = DoorAnchor(Door)
+        if not Anchor then return end
+        local Works = Door:GetAttribute("ActuallyWorks") and not Door:GetAttribute("DoesntWork")
+        local Color = Works and EXIT_OK_COLOR or EXIT_FAKE_COLOR
+        local Text = Works and ("EXIT  " .. DoorKeyCount(Door) .. "/3 keys") or "FAKE / LOCKED"
+        table.insert(ExitESPObjects, MakeHighlight(Door, Color))
+        table.insert(ExitESPObjects, MakeBillboard(Anchor, Text, Color))
+    end)
+end
+
+local function RebuildKeyESP()
+    ClearList(KeyESPObjects)
+    if not KeyESPEnabled then return end
+    for _, Entry in ipairs(FindWorldKeys()) do
+        table.insert(KeyESPObjects, MakeHighlight(Entry.Instance, KEY_COLOR))
+        table.insert(KeyESPObjects, MakeBillboard(Entry.Anchor, "KEY: " .. Entry.Shape, KEY_COLOR))
+    end
+end
+
+local ESPLoopRunning = false
+local function StartESPLoop()
+    if ESPLoopRunning then return end
+    ESPLoopRunning = true
+    task.spawn(function()
+        while (PlayerESPEnabled or ExitESPEnabled or KeyESPEnabled) and not Library.Unloaded do
+            RebuildPlayerESP()
+            RebuildExitESP()
+            RebuildKeyESP()
+            task.wait(0.5)
+        end
+        ClearList(PlayerESPObjects)
+        ClearList(ExitESPObjects)
+        ClearList(KeyESPObjects)
+        ESPLoopRunning = false
+    end)
+end
+
+--// Auto Escape \\--
+local AutoEscapeEnabled = false
+local AutoEscapeRunning = false
+local EscapeStatus = "Idle"
+
+local function TeleportTo(Position, Offset)
+    local HRP = GetHRP()
+    if not HRP then return false end
+    HRP.CFrame = CFrame.new(Position + (Offset or Vector3.new(0, 1.5, 0)))
+    return true
+end
+
+-- Teleport to the nearest missing key and try to pick it up. Returns true only
+-- once no keys are missing; the escape loop re-checks each tick.
+local function CollectNearestMissingKey()
+    local Missing = MissingKeys()
+    if #Missing == 0 then return true end
+    local HRP = GetHRP()
+    if not HRP then return false end
+
+    local NeedSet = {}
+    for _, K in ipairs(Missing) do NeedSet[K] = true end
+
+    local Best, BestDist
+    for _, Entry in ipairs(FindWorldKeys()) do
+        if NeedSet[Entry.Shape] then
+            local D = (HRP.Position - Entry.Anchor.Position).Magnitude
+            if not BestDist or D < BestDist then
+                Best, BestDist = Entry, D
+            end
+        end
+    end
+    if not Best then
+        EscapeStatus = "No world key found (needs calibration)"
+        return false
+    end
+
+    EscapeStatus = "Grabbing " .. Best.Shape .. " key"
+    TeleportTo(Best.Anchor.Position, Vector3.new(0, 1.5, 0))
+    -- pickup is either a Touched trigger (the teleport covers it) or a prompt
+    if fireproximityprompt then
+        for _, D in ipairs(Best.Instance:GetDescendants()) do
+            if D:IsA("ProximityPrompt") then
+                pcall(fireproximityprompt, D)
+            end
+        end
+    end
+    return false
+end
+
+local function DoEscape()
+    local Door = FindWorkingExit()
+    if not Door then
+        EscapeStatus = "Looking for the working exit"
+        return
+    end
+    local Anchor = DoorAnchor(Door)
+    if not Anchor then return end
+
+    EscapeStatus = "Feeding keys into exit"
+    TeleportTo(Anchor.Position, Vector3.new(0, 1.5, 0))
+    for _, Key in ipairs(HNS_KEYS) do
+        if HeldKey(Key) and not Door:GetAttribute(Key) then
+            FireRemote({ AttemptingToEscape = Door })
+            task.wait(0.4)
+        end
+    end
+    if Door:GetAttribute("CANESCAPE") then
+        EscapeStatus = "Escaping!"
+        FireRemote({ ESCAPING = Door })
+    end
+end
+
+local function StartAutoEscape()
+    if AutoEscapeRunning then return end
+    AutoEscapeRunning = true
+    task.spawn(function()
+        while AutoEscapeEnabled and not Library.Unloaded do
+            if not IsHider() then
+                EscapeStatus = "Not a hider"
+            elseif LocalPlayer:GetAttribute("HNSDidEscape") then
+                EscapeStatus = "Escaped"
+            elseif #MissingKeys() > 0 then
+                CollectNearestMissingKey()
+            else
+                DoEscape()
+            end
+            task.wait(0.5)
+        end
+        AutoEscapeRunning = false
+        EscapeStatus = "Idle"
+    end)
+end
+
+--// UI \\--
+local EscapeGroup = HideSeekTab:AddLeftGroupbox("Auto Escape (Hider)")
+
+local EscapeStatusLabel = EscapeGroup:AddLabel("Status: Idle", true)
+
+EscapeGroup:AddToggle("HNSAutoEscape", {
+    Text = "Auto Escape",
+    Default = false,
+    Tooltip = "Coleta as chaves que faltam e escapa pela saida que funciona, tudo pelo remoto do jogo",
+}):OnChanged(function(Value)
+    AutoEscapeEnabled = Value
+    if Value then StartAutoEscape() end
+end)
+
+EscapeGroup:AddButton("Escape Now", function()
+    task.spawn(function()
+        if not IsHider() then
+            Library:Notify("Hide n Seek: voce nao e hider.", 3)
+            return
+        end
+        if #MissingKeys() > 0 then
+            CollectNearestMissingKey()
+        else
+            DoEscape()
+        end
+    end)
+end)
+
+task.spawn(function()
+    while not Library.Unloaded do
+        pcall(function() EscapeStatusLabel:SetText("Status: " .. EscapeStatus) end)
+        task.wait(0.3)
+    end
+end)
+
+local ESPGroup = HideSeekTab:AddRightGroupbox("ESP")
+
+ESPGroup:AddToggle("HNSPlayerESP", {
+    Text = "Player ESP",
+    Default = false,
+    Tooltip = "Destaca jogadores: verde = hider, vermelho = seeker/hunter (com distancia)",
+}):OnChanged(function(Value)
+    PlayerESPEnabled = Value
+    if Value then StartESPLoop() else RebuildPlayerESP() end
+end)
+
+ESPGroup:AddToggle("HNSExitESP", {
+    Text = "Exit ESP",
+    Default = false,
+    Tooltip = "Destaca as saidas: verde = funciona (mostra chaves X/3), vermelho = falsa/trancada",
+}):OnChanged(function(Value)
+    ExitESPEnabled = Value
+    if Value then StartESPLoop() else RebuildExitESP() end
+end)
+
+ESPGroup:AddToggle("HNSKeyESP", {
+    Text = "Key ESP",
+    Default = false,
+    Tooltip = "Destaca as chaves espalhadas no mapa (pode precisar de calibracao no jogo)",
+}):OnChanged(function(Value)
+    KeyESPEnabled = Value
+    if Value then StartESPLoop() else RebuildKeyESP() end
+end)
+
+Library:OnUnload(function()
+    AutoEscapeEnabled = false
+    PlayerESPEnabled = false
+    ExitESPEnabled = false
+    KeyESPEnabled = false
+    if ESPFolder then
+        ESPFolder:Destroy()
+    end
 end)
 
 --// Visuals \\--
