@@ -33,6 +33,7 @@ local Tabs = {
     ["Red Light"] = Window:AddTab("Red Light", "traffic-cone"),
     Dalgona = Window:AddTab("Dalgona", "cookie"),
     ["Hide n Seek"] = Window:AddTab("Hide n Seek", "ghost"),
+    Mingle = Window:AddTab("Mingle", "zap"),
     Visuals = Window:AddTab("Visuals", "eye"),
     Misc = Window:AddTab("Misc", "package"),
     ["UI Settings"] = Window:AddTab("UI Settings", "settings"),
@@ -954,6 +955,105 @@ Library:OnUnload(function()
     if ESPFolder then
         ESPFolder:Destroy()
     end
+end)
+
+--// Mingle \\--
+-- The QTE system (ModuleScript HBGQTE, shared by Mingle and any other QTE game)
+-- is client-authoritative: the client decides hit vs miss itself and only then
+-- tells the server, firing Character.RemoteForQTE (hit) or FailRemoteForQTE
+-- (miss) with no timing proof (RemoteForQTE:FireServer() takes no args). The
+-- returned module table exposes ActiveButtons (the live on-screen prompts) and
+-- Pressed(failed, button); calling Pressed(false, button) forces the hit branch
+-- and sets PressedOnce/Tweening so the fail timeout never fires the miss remote.
+-- Auto QTE just pushes every active prompt through the game's own hit path.
+local MingleTab = Tabs.Mingle
+local MingleGroup = MingleTab:AddLeftGroupbox("Mingle")
+
+-- The QTE module is a session singleton (required once), so find it by its field
+-- signature and cache it - only touch getgc while we haven't found it yet.
+local QTEModule = nil
+
+local function FindQTEModule()
+    if QTEModule then return QTEModule end
+    if not Getgc then return nil end
+    local ok, GC = pcall(Getgc, true)
+    if not ok then return nil end
+    for _, Value in pairs(GC) do
+        if type(Value) == "table"
+            and type(rawget(Value, "Pressed")) == "function"
+            and type(rawget(Value, "SetUpButton")) == "function"
+            and type(rawget(Value, "ActiveButtons")) == "table" then
+            QTEModule = Value
+            return QTEModule
+        end
+    end
+    return nil
+end
+
+-- Push every active, not-yet-pressed prompt through the hit path. Each runs in
+-- its own thread (the hit branch yields ~0.32s on the screen flash) and we guard
+-- a nil Data table so Pressed can't error before it fires the success remote.
+local function PassActiveQTEs(Module)
+    local Count = 0
+    for _, Button in pairs(Module.ActiveButtons) do
+        if type(Button) == "table" and typeof(Button.Outer) == "Instance"
+            and not Button.Outer:GetAttribute("PressedOnce") then
+            if type(Button.Data) ~= "table" then
+                Button.Data = {}
+            end
+            task.spawn(function()
+                pcall(Module.Pressed, false, Button)
+            end)
+            Count = Count + 1
+        end
+    end
+    return Count
+end
+
+local AutoQTEEnabled = false
+local AutoQTERunning = false
+
+local function StartAutoQTE()
+    if AutoQTERunning then return end
+    AutoQTERunning = true
+    task.spawn(function()
+        while AutoQTEEnabled and not Library.Unloaded do
+            local Module = FindQTEModule()
+            if Module then
+                PassActiveQTEs(Module)
+                task.wait(0.05)
+            else
+                task.wait(0.5) -- module not loaded yet (no QTE game running)
+            end
+        end
+        AutoQTERunning = false
+    end)
+end
+
+if not Getgc then
+    MingleGroup:AddLabel("Seu executor nao tem getgc - Auto QTE indisponivel.", true)
+else
+    MingleGroup:AddToggle("MingleAutoQTE", {
+        Text = "Auto QTE",
+        Default = false,
+        Tooltip = "Acerta todo QTE automaticamente pelo proprio caminho de acerto do jogo. Serve pro Mingle e qualquer jogo com o mesmo QTE - liga numa partida de Tug pra testar.",
+    }):OnChanged(function(Value)
+        AutoQTEEnabled = Value
+        if Value then StartAutoQTE() end
+    end)
+
+    MingleGroup:AddButton("Force QTE Pass", function()
+        local Module = FindQTEModule()
+        if not Module then
+            Library:Notify("Mingle: QTE module nao encontrado (entra num QTE primeiro).", 3)
+            return
+        end
+        Library:Notify(("Mingle: %d QTE(s) passados."):format(PassActiveQTEs(Module)), 3)
+    end)
+end
+
+Library:OnUnload(function()
+    AutoQTEEnabled = false
 end)
 
 --// Visuals \\--
