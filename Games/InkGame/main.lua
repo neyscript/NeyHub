@@ -35,6 +35,7 @@ local Tabs = {
     ["Hide n Seek"] = Window:AddTab("Hide n Seek", "ghost"),
     Mingle = Window:AddTab("Mingle", "zap"),
     ["Glass Bridge"] = Window:AddTab("Glass Bridge", "footprints"),
+    Pentathlon = Window:AddTab("Pentathlon", "medal"),
     Visuals = Window:AddTab("Visuals", "eye"),
     Misc = Window:AddTab("Misc", "package"),
     ["UI Settings"] = Window:AddTab("UI Settings", "settings"),
@@ -1273,6 +1274,196 @@ Library:OnUnload(function()
     AntiBreakEnabled = false
     RestoreAntiBreak()
 end)
+
+--// Pentathlon \\--
+-- Pentathlon is 5 mini-games (Ddakji, Flying Stone, Gonggi, Spinning Top, Jegi).
+-- Each one, when cleared, calls v_u_25.RunServerGame(game, "Action", data), which
+-- is just Remote:FireServer(game.GUID, "Action", data). The server trusts the
+-- client's outcome (Spinning Top sends Thrown {} on success vs Thrown {Failed=true}
+-- on timeout - only the flag differs), so we can fire the success payload directly.
+-- We reach the module (v_u_25: RunServerGame + AddActiveGame + Start) and the local
+-- player's current game object (metatable = the class carrying .Ddakji etc., Active,
+-- and our character in PlayersIndex) through getgc, then push the win action. One
+-- button per game since the game object doesn't record which mini-game it is - you
+-- click the one you're in. Success payloads pulled straight from the decompile:
+--   Spinning Top -> "Thrown" {} then "Tied" {}
+--   Jegi         -> "Kick" { Lose = false } x6 (client counter caps at 6)
+--   Gonggi       -> "GotPiece" { Name } per piece, then "TimeSlowFinish"
+--   Ddakji       -> "Thrown" { Power, Position }
+--   Flying Stone -> "Thrown" { ThrowPower, Origin, Direction }
+local PentTab = Tabs.Pentathlon
+local PentSupported = Getgc and true or false
+local PentModule = nil
+local PentThrowPower = 0.5
+
+local function FindPentModule()
+    if PentModule and type(rawget(PentModule, "RunServerGame")) == "function" then
+        return PentModule
+    end
+    if not Getgc then return nil end
+    local ok, GC = pcall(Getgc, true)
+    if not ok then return nil end
+    for _, Value in pairs(GC) do
+        if type(Value) == "table"
+            and type(rawget(Value, "RunServerGame")) == "function"
+            and type(rawget(Value, "AddActiveGame")) == "function"
+            and type(rawget(Value, "Start")) == "function" then
+            PentModule = Value
+            return Value
+        end
+    end
+    return nil
+end
+
+-- The active game object holding our character (metatable = the game class,
+-- recognised by its .Ddakji method). Re-found each press since it's per-round.
+local function FindCurrentGame()
+    if not Getgc then return nil end
+    local Char = LocalPlayer.Character
+    if not Char then return nil end
+    local ok, GC = pcall(Getgc, true)
+    if not ok then return nil end
+    for _, Value in pairs(GC) do
+        if type(Value) == "table" and rawget(Value, "GUID")
+            and type(rawget(Value, "PlayersIndex")) == "table" then
+            local Mt = getmetatable(Value)
+            if type(Mt) == "table" and type(rawget(Mt, "Ddakji")) == "function"
+                and Value.Active and Value.PlayersIndex[Char] then
+                return Value
+            end
+        end
+    end
+    return nil
+end
+
+-- Returns module, game, error-message.
+local function PentReady()
+    local Module = FindPentModule()
+    if not Module then return nil, nil, "modulo nao carregado (entra no Pentathlon)" end
+    local Game = FindCurrentGame()
+    if not Game then return nil, nil, "jogo atual nao encontrado (entra numa prova)" end
+    return Module, Game, nil
+end
+
+local function PentFire(Module, Game, Action, Data)
+    return pcall(function()
+        Module.RunServerGame(Game, Action, Data)
+    end)
+end
+
+-- Aim a point on the map for the throw games (camera forward onto PentathlonMap).
+local function PentAimPosition()
+    local Char = LocalPlayer.Character
+    local HRP = Char and Char:FindFirstChild("HumanoidRootPart")
+    if not HRP then return Vector3.new() end
+    local Cam = workspace.CurrentCamera
+    local Origin = HRP.Position
+    local Direction = (Cam and Cam.CFrame.LookVector) or HRP.CFrame.LookVector
+    local Map = workspace:FindFirstChild("PentathlonMap")
+    if Map then
+        local Params = RaycastParams.new()
+        Params.FilterType = Enum.RaycastFilterType.Include
+        Params.FilterDescendantsInstances = { Map }
+        local Hit = workspace:Raycast(Origin, Direction * 200, Params)
+        if Hit then return Hit.Position end
+    end
+    return Origin + Direction * 10
+end
+
+local PentGroup = PentTab:AddLeftGroupbox("Auto Pass (clique no jogo atual)")
+
+if not PentSupported then
+    PentGroup:AddLabel("Seu executor nao tem getgc - Pentathlon indisponivel.", true)
+else
+    PentGroup:AddButton("Spinning Top - Pass", function()
+        local Module, Game, Err = PentReady()
+        if not Module then Library:Notify("Pentathlon: " .. Err, 3) return end
+        task.spawn(function()
+            PentFire(Module, Game, "Thrown", {})
+            task.wait(0.6)
+            PentFire(Module, Game, "Tied", {})
+        end)
+        Library:Notify("Pentathlon (Spinning Top): enviado", 3)
+    end)
+
+    PentGroup:AddButton("Jegi - Pass", function()
+        local Module, Game, Err = PentReady()
+        if not Module then Library:Notify("Pentathlon: " .. Err, 3) return end
+        task.spawn(function()
+            for _ = 1, 6 do
+                PentFire(Module, Game, "Kick", { Lose = false })
+                task.wait(0.35)
+            end
+        end)
+        Library:Notify("Pentathlon (Jegi): mandando 6 kicks", 3)
+    end)
+
+    PentGroup:AddButton("Ddakji - Pass", function()
+        local Module, Game, Err = PentReady()
+        if not Module then Library:Notify("Pentathlon: " .. Err, 3) return end
+        PentFire(Module, Game, "Thrown", {
+            Power = PentThrowPower,
+            Position = PentAimPosition(),
+        })
+        Library:Notify("Pentathlon (Ddakji): enviado (Power " .. PentThrowPower .. ")", 3)
+    end)
+
+    PentGroup:AddButton("Flying Stone - Pass", function()
+        local Module, Game, Err = PentReady()
+        if not Module then Library:Notify("Pentathlon: " .. Err, 3) return end
+        local Char = LocalPlayer.Character
+        local HRP = Char and Char:FindFirstChild("HumanoidRootPart")
+        local Origin = HRP and HRP.Position or Vector3.new()
+        local Cam = workspace.CurrentCamera
+        local Direction = (Cam and Cam.CFrame.LookVector) or (HRP and HRP.CFrame.LookVector) or Vector3.new(0, 0, -1)
+        PentFire(Module, Game, "Thrown", {
+            ThrowPower = PentThrowPower,
+            Origin = Origin,
+            Direction = Direction,
+        })
+        Library:Notify("Pentathlon (Flying Stone): enviado", 3)
+    end)
+
+    PentGroup:AddButton("Gonggi - Pass", function()
+        local Module, Game, Err = PentReady()
+        if not Module then Library:Notify("Pentathlon: " .. Err, 3) return end
+        task.spawn(function()
+            -- best-effort: report every gonggi piece we can find, then finish
+            local Map = workspace:FindFirstChild("PentathlonMap")
+            local Fired = 0
+            if Map then
+                for _, Desc in ipairs(Map:GetDescendants()) do
+                    if Desc:IsA("BasePart") and Desc.Name:lower():find("gonggi") then
+                        PentFire(Module, Game, "GotPiece", { Name = Desc.Name })
+                        Fired = Fired + 1
+                        task.wait(0.1)
+                    end
+                end
+            end
+            PentFire(Module, Game, "TimeSlowFinish")
+            Library:Notify(("Pentathlon (Gonggi): %d pecas + finish"):format(Fired), 3)
+        end)
+    end)
+
+    PentGroup:AddSlider("PentThrowPower", {
+        Text = "Throw Power",
+        Default = 0.5,
+        Min = 0,
+        Max = 1,
+        Rounding = 2,
+        Tooltip = "Power usado no Ddakji / Flying Stone. Calibra testando (zona verde ~0.4-0.6).",
+        Callback = function(Value)
+            PentThrowPower = Value
+        end,
+    })
+
+    PentGroup:AddButton("Detect Game", function()
+        local Module = FindPentModule()
+        local Game = FindCurrentGame()
+        Library:Notify(("Pentathlon: module=%s game=%s"):format(
+            Module and "OK" or "nao", Game and tostring(Game.GUID) or "nao"), 4)
+    end)
+end
 
 --// Visuals \\--
 local VisualsGroup = Tabs.Visuals:AddLeftGroupbox("Visuals")
