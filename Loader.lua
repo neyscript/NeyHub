@@ -20,6 +20,7 @@ local SUPPORTED_GAMES = {
     [119099244949868] = "Games/InkGame/main.lua", -- [🔥] Ink Game (lobby)
     [125009265613167] = "Games/InkGame/main.lua", -- [🔥] Ink Game (match)
     [99567941238278] = "Games/InkGame/main.lua", -- [🔥] Ink Game (universe root place)
+    [90407707718652] = "Games/InkGame/main.lua", -- [🔥] Ink Game (training center)
 }
 
 local ScriptPath = SUPPORTED_GAMES[game.PlaceId]
