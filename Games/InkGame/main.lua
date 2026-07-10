@@ -34,6 +34,7 @@ local Tabs = {
     Dalgona = Window:AddTab("Dalgona", "cookie"),
     ["Hide n Seek"] = Window:AddTab("Hide n Seek", "ghost"),
     Mingle = Window:AddTab("Mingle", "zap"),
+    ["Glass Bridge"] = Window:AddTab("Glass Bridge", "footprints"),
     Visuals = Window:AddTab("Visuals", "eye"),
     Misc = Window:AddTab("Misc", "package"),
     ["UI Settings"] = Window:AddTab("UI Settings", "settings"),
@@ -1054,6 +1055,223 @@ end
 
 Library:OnUnload(function()
     AutoQTEEnabled = false
+end)
+
+--// Glass Bridge \\--
+-- Which tile breaks is marked by the attribute "exploitingisevil" on each
+-- panel's PrimaryPart (a troll name, but it's what the game reads on Touch,
+-- lines 213-216 of GlassBridgeClient). Panels live under
+-- workspace.GlassBridge.GlassHolder -> rows -> Model tiles (each with a
+-- PrimaryPart). Death is client-driven: the Touched handler (v_u_56) fires
+-- { TouchedGlass = panel, ... } to the server and runs the local kill v_u_48,
+-- which fires { FallingPlayer = true, ... }. So:
+--   * ESP just reads the attribute and colours tiles green/red.
+--   * Anti Break gates v_u_56 (v_u_25 = true -> the whole handler no-ops, so no
+--     TouchedGlass, no shatter) and no-ops v_u_48 everywhere it's held (kills the
+--     fall path too). Reached through upvalues, same as Dalgona.
+local GlassTab = Tabs["Glass Bridge"]
+
+local GLASS_SAFE_COLOR = Color3.fromRGB(60, 200, 90)
+local GLASS_BREAK_COLOR = Color3.fromRGB(235, 60, 60)
+
+-- With pity on, only "exploitingisevil" tiles that also flag ActuallyKilling
+-- break; with pity off, every "exploitingisevil" tile breaks.
+local function GlassPanelBreaks(PrimaryPart)
+    if not PrimaryPart:GetAttribute("exploitingisevil") then
+        return false
+    end
+    if workspace:GetAttribute("GlassBridgePityEnabled") then
+        return PrimaryPart:GetAttribute("ActuallyKilling") == true
+    end
+    return true
+end
+
+local function ForEachGlassPanel(Callback)
+    local Bridge = workspace:FindFirstChild("GlassBridge")
+    local Holder = Bridge and Bridge:FindFirstChild("GlassHolder")
+    if not Holder then return end
+    for _, Row in ipairs(Holder:GetChildren()) do
+        for _, Tile in ipairs(Row:GetChildren()) do
+            if Tile:IsA("Model") and Tile.PrimaryPart then
+                Callback(Tile, Tile.PrimaryPart)
+            end
+        end
+    end
+end
+
+--// Glass ESP \\--
+local GlassESPEnabled = false
+local GlassESPRunning = false
+local GlassESPObjects = {}
+
+local function RebuildGlassESP()
+    ClearList(GlassESPObjects)
+    if not GlassESPEnabled then return end
+    ForEachGlassPanel(function(Tile, Primary)
+        local Color = GlassPanelBreaks(Primary) and GLASS_BREAK_COLOR or GLASS_SAFE_COLOR
+        table.insert(GlassESPObjects, MakeHighlight(Tile, Color))
+    end)
+end
+
+local function StartGlassESP()
+    if GlassESPRunning then return end
+    GlassESPRunning = true
+    task.spawn(function()
+        while GlassESPEnabled and not Library.Unloaded do
+            RebuildGlassESP()
+            task.wait(0.5)
+        end
+        ClearList(GlassESPObjects)
+        GlassESPRunning = false
+    end)
+end
+
+--// Anti Break \\--
+local GlassSupported = Getgc and GetConstants and GetUpvalues and SetUpvalue
+local AntiBreakEnabled = false
+local AntiBreakRoundApplied = false
+local AntiBreakWatcherRunning = false
+local AntiBreakState = {}
+
+local function ApplyAntiBreak()
+    if not GlassSupported then return false, "no getgc/upvalue support" end
+    local ok, GC = pcall(Getgc, true)
+    if not ok then return false, "getgc failed" end
+
+    local KillFn, TouchFn
+    for _, Fn in pairs(GC) do
+        if type(Fn) == "function" and (not IsLClosure or IsLClosure(Fn)) then
+            if not KillFn and FnHasConstants(Fn, { "FallingPlayer", "funnydeath" }) then
+                KillFn = Fn
+            end
+            if not TouchFn and FnHasConstants(Fn, { "TouchedGlass", "exploitingisevil" }) then
+                TouchFn = Fn
+            end
+        end
+    end
+    if not (KillFn or TouchFn) then
+        return false, "closures not found (round active?)"
+    end
+
+    -- Gate the Touched handler: its first boolean upvalue is v_u_25; true = no-op.
+    if TouchFn then
+        local upsOk, Ups = pcall(GetUpvalues, TouchFn)
+        if upsOk and Ups then
+            for Index = 1, 32 do
+                if type(Ups[Index]) == "boolean" then
+                    table.insert(AntiBreakState, { Fn = TouchFn, Index = Index, Original = Ups[Index] })
+                    pcall(SetUpvalue, TouchFn, Index, true)
+                    break
+                end
+            end
+        end
+    end
+
+    -- No-op the kill function wherever it is held (Touched path + fall check).
+    if KillFn then
+        for _, Fn in pairs(GC) do
+            if type(Fn) == "function" and (not IsLClosure or IsLClosure(Fn)) then
+                local upsOk, Ups = pcall(GetUpvalues, Fn)
+                if upsOk and Ups then
+                    for Index, Value in pairs(Ups) do
+                        if Value == KillFn then
+                            table.insert(AntiBreakState, { Fn = Fn, Index = Index, Original = Value })
+                            pcall(SetUpvalue, Fn, Index, function() end)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if #AntiBreakState > 0 then
+        return true, ("neutralized %d hook(s)"):format(#AntiBreakState)
+    end
+    return false, "found closures but couldn't patch"
+end
+
+local function RestoreAntiBreak()
+    for _, S in ipairs(AntiBreakState) do
+        pcall(SetUpvalue, S.Fn, S.Index, S.Original)
+    end
+    table.clear(AntiBreakState)
+end
+
+local function GlassRoundActive()
+    local Char = LocalPlayer.Character
+    if Char and Char:FindFirstChild("PlayingGlassBridge") then
+        return true
+    end
+    local Bridge = workspace:FindFirstChild("GlassBridge")
+    local Holder = Bridge and Bridge:FindFirstChild("GlassHolder")
+    return Holder ~= nil and #Holder:GetChildren() > 0
+end
+
+-- Every round builds fresh closures, so re-apply per round (like Dalgona).
+local function StartAntiBreakWatcher()
+    if AntiBreakWatcherRunning then return end
+    AntiBreakWatcherRunning = true
+    task.spawn(function()
+        while AntiBreakEnabled and not Library.Unloaded do
+            if GlassRoundActive() then
+                if not AntiBreakRoundApplied then
+                    AntiBreakRoundApplied = (ApplyAntiBreak())
+                end
+            elseif AntiBreakRoundApplied then
+                RestoreAntiBreak()
+                AntiBreakRoundApplied = false
+            end
+            task.wait(0.5)
+        end
+        RestoreAntiBreak()
+        AntiBreakRoundApplied = false
+        AntiBreakWatcherRunning = false
+    end)
+end
+
+--// UI \\--
+local GlassESPGroup = GlassTab:AddLeftGroupbox("ESP")
+
+GlassESPGroup:AddToggle("GlassESP", {
+    Text = "Glass ESP",
+    Default = false,
+    Tooltip = "Verde = vidro seguro, vermelho = quebra (le o atributo exploitingisevil). So andar no verde.",
+}):OnChanged(function(Value)
+    GlassESPEnabled = Value
+    if Value then StartGlassESP() else RebuildGlassESP() end
+end)
+
+local GlassSafetyGroup = GlassTab:AddRightGroupbox("Safety")
+
+if not GlassSupported then
+    GlassSafetyGroup:AddLabel("Seu executor nao tem getgc - Anti Break indisponivel.", true)
+else
+    GlassSafetyGroup:AddToggle("GlassAntiBreak", {
+        Text = "Anti Break (experimental)",
+        Default = false,
+        Tooltip = "Neutraliza o handler de toque e a funcao de morte pelos upvalues. Se o break for client-driven, voce nao quebra nem pisando no errado.",
+    }):OnChanged(function(Value)
+        AntiBreakEnabled = Value
+        if Value then
+            AntiBreakRoundApplied = false
+            StartAntiBreakWatcher()
+        else
+            RestoreAntiBreak()
+            AntiBreakRoundApplied = false
+        end
+    end)
+
+    GlassSafetyGroup:AddButton("Apply Now", function()
+        local Ok, Message = ApplyAntiBreak()
+        Library:Notify("Glass Bridge: " .. tostring(Message), 3)
+        if Ok then AntiBreakRoundApplied = true end
+    end)
+end
+
+Library:OnUnload(function()
+    GlassESPEnabled = false
+    AntiBreakEnabled = false
+    RestoreAntiBreak()
 end)
 
 --// Visuals \\--
