@@ -631,23 +631,36 @@ local function FindWorkingExit()
     return Working
 end
 
---// World keys (heuristic - calibrate live if empty) \\--
--- The module never touches the collectible keys, so we sweep the map for shape-
--- named parts/models that aren't the exit-door key slots (those live under
--- NEWFIXEDDOORS). Returns { { Instance = ..., Shape = "Square" }, ... }.
+--// World keys \\--
+-- Found live via Dex: collectible keys are dropped parts under workspace.Effects
+-- named "DroppedKey<Shape>" (DroppedKeySquare / DroppedKeyTriangle / DroppedKeyCircle).
+-- The <Shape> suffix is the key you receive, so we can target exactly the one
+-- that's still missing. NB: they seem to stream in only once you're near
+-- (StreamingEnabled), so distant keys can be invisible until approached.
+-- Returns { { Instance = ..., Anchor = ..., Shape = "Square" }, ... }.
+local function KeyShapeFromName(Name)
+    local Suffix = Name:match("^DroppedKey(%a+)$")
+    if not Suffix then return nil end
+    for _, Key in ipairs(HNS_KEYS) do
+        if Suffix == Key then return Key end
+    end
+    return Suffix -- still a key, just an unexpected shape name
+end
+
+local function KeyAnchor(Inst)
+    if Inst:IsA("BasePart") then return Inst end
+    if Inst:IsA("Model") then return Inst.PrimaryPart or Inst:FindFirstChildWhichIsA("BasePart") end
+    return nil
+end
+
 local function FindWorldKeys(FilterShape)
-    local Map = workspace:FindFirstChild("HideAndSeekMap")
     local Result = {}
-    if not Map then return Result end
-    local Fixed = GetFixedDoors()
-    for _, Desc in ipairs(Map:GetDescendants()) do
-        local Shape
-        for _, Key in ipairs(HNS_KEYS) do
-            if Desc.Name == Key then Shape = Key break end
-        end
-        if Shape and (not FilterShape or FilterShape == Shape)
-            and not (Fixed and Desc:IsDescendantOf(Fixed)) then
-            local Anchor = (Desc:IsA("Model") and Desc.PrimaryPart) or (Desc:IsA("BasePart") and Desc)
+    local Effects = workspace:FindFirstChild("Effects")
+    if not Effects then return Result end
+    for _, Desc in ipairs(Effects:GetChildren()) do
+        local Shape = KeyShapeFromName(Desc.Name)
+        if Shape and (not FilterShape or FilterShape == Shape) then
+            local Anchor = KeyAnchor(Desc)
             if Anchor then
                 table.insert(Result, { Instance = Desc, Anchor = Anchor, Shape = Shape })
             end
@@ -808,7 +821,7 @@ local function CollectNearestMissingKey()
         end
     end
     if not Best then
-        EscapeStatus = "No world key found (needs calibration)"
+        EscapeStatus = "No key loaded nearby (get closer / none left)"
         return false
     end
 
